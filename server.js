@@ -7,7 +7,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const STREAM_SECRET = String(process.env.STREAM_SECRET || '').trim();
 const GEMINI_LIVE_MODEL = String(process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-preview-12-2025').trim();
-const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Schedar').trim();
+const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Sadaltager').trim();
 const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ומכבד.').trim();
 const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
 const BARGE_IN_FRAMES = Math.max(1, Number(process.env.BARGE_IN_FRAMES) || 3);
@@ -80,6 +80,10 @@ wss.on('connection', ws => {
   const call = { callId: '', caller: '', system: '', token: '', closing: false, startedAt: 0 };
   let gemini = null;
   let geminiReady = false;
+  let callerAudioFrames = 0;
+  let geminiResponseAudioChunks = 0;
+  let geminiResponseAudioBytes = 0;
+  let geminiResponseAudioRate = 24000;
   let aiSpeaking = false;
   let loudFrames = 0;
   const pbxAudioQueue = [];
@@ -246,7 +250,16 @@ wss.on('connection', ws => {
 
       const serverContent = message.serverContent;
       if (serverContent?.interrupted) {
-        console.log(call.callId, 'Gemini reported interrupted response');
+        console.log(
+          call.callId,
+          'Gemini reported interrupted response; audio chunks generated:',
+          geminiResponseAudioChunks,
+          'audio bytes generated:',
+          geminiResponseAudioBytes
+        );
+        geminiResponseAudioChunks = 0;
+        geminiResponseAudioBytes = 0;
+        geminiResponseAudioRate = 24000;
         sendClear('Gemini detected caller interruption');
       }
 
@@ -256,8 +269,14 @@ wss.on('connection', ws => {
         const base64 = inline?.data;
         if (!base64) continue;
         const pcm = Buffer.from(base64, 'base64');
+        if (geminiResponseAudioChunks === 0) {
+          console.log(call.callId, 'Gemini response audio started');
+        }
+        geminiResponseAudioChunks++;
+        geminiResponseAudioBytes += pcm.length;
         const pcmMime = inline.mimeType || inline.mime_type || '';
         const outputRate = Number(/rate=(\d+)/i.exec(pcmMime)?.[1]) || 24000;
+        geminiResponseAudioRate = outputRate;
         const pcm8k = outputRate === 8000 ? pcm : pcm24kTo8k(pcm);
         if (ws.readyState === WebSocket.OPEN && pcm8k.length) {
           enqueuePbxAudio(pcm8k);
@@ -265,6 +284,16 @@ wss.on('connection', ws => {
       }
 
       if (serverContent?.turnComplete) {
+        console.log(
+          call.callId,
+          'Gemini turn complete; audio chunks:',
+          geminiResponseAudioChunks,
+          'audio seconds:',
+          (geminiResponseAudioBytes / (geminiResponseAudioRate * 2)).toFixed(2)
+        );
+        geminiResponseAudioChunks = 0;
+        geminiResponseAudioBytes = 0;
+        geminiResponseAudioRate = 24000;
         pbxAudioFlushPending = true;
         if (!pbxPlaybackTimer && pbxAudioQueueBytes > 0) {
           pbxPlaybackTimer = setInterval(pumpPbxAudio, PBX_AUDIO_FRAME_MS);
@@ -293,6 +322,20 @@ wss.on('connection', ws => {
       const audio = Buffer.isBuffer(data) ? data : Buffer.from(data);
       if (audio.length < 2) return;
       const rms = pcmRms(audio);
+      callerAudioFrames++;
+      if (callerAudioFrames === 1 || callerAudioFrames % 250 === 0) {
+        console.log(
+          call.callId,
+          'caller audio frames received:',
+          callerAudioFrames,
+          'latest frame bytes:',
+          audio.length,
+          'RMS:',
+          Math.round(rms),
+          'sent to Gemini:',
+          geminiReady
+        );
+      }
 
       if (aiSpeaking) {
         loudFrames = rms >= BARGE_IN_RMS ? loudFrames + 1 : 0;
