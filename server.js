@@ -83,6 +83,9 @@ wss.on('connection', ws => {
   let pendingAudioBytes = 0;
   let inputFrames = 0;
   let outputFrames = 0;
+  let responseNumber = 0;
+  let responseAudioFrames = 0;
+  let voicedInputFrames = 0;
 
   const closeGemini = () => {
     if (gemini && gemini.readyState === WebSocket.OPEN) gemini.close();
@@ -153,19 +156,19 @@ wss.on('connection', ws => {
           }
         }));
         console.log(call.callId, 'opening greeting requested');
-        const queued = pendingAudio;
+        const discarded = pendingAudio.length;
         pendingAudio = [];
         pendingAudioBytes = 0;
-        for (const audio of queued) sendAudioToGemini(audio);
-        if (queued.length) console.log(call.callId, 'flushed buffered caller audio frames', queued.length);
+        if (discarded) console.log(call.callId, 'discarded audio received before Gemini was ready', discarded, 'frames');
         return;
       }
 
       const serverContent = message.serverContent;
-      if (serverContent?.inputTranscription?.finished && serverContent.inputTranscription.text) {
-        console.log(call.callId, 'Gemini received caller speech transcript', serverContent.inputTranscription.text.length, 'characters');
+      if (serverContent?.inputTranscription?.text) {
+        console.log(call.callId, 'Gemini caller transcription event', serverContent.inputTranscription.text.length, 'characters', serverContent.inputTranscription.finished ? 'final' : 'partial');
       }
       if (serverContent?.interrupted) {
+        console.log(call.callId, 'Gemini reported interrupted response');
         sendClear('Gemini detected caller interruption');
       }
 
@@ -179,6 +182,11 @@ wss.on('connection', ws => {
         const outputRate = Number(/rate=(\d+)/i.exec(pcmMime)?.[1]) || 24000;
         const pcm8k = outputRate === 8000 ? pcm : pcm24kTo8k(pcm);
         if (ws.readyState === WebSocket.OPEN && pcm8k.length) {
+          if (responseAudioFrames === 0) {
+            responseNumber++;
+            console.log(call.callId, 'Gemini response audio started', responseNumber, pcmMime || 'rate=24000 assumed');
+          }
+          responseAudioFrames++;
           aiSpeaking = true;
           ws.send(pcm8k, { binary: true });
           outputFrames++;
@@ -186,7 +194,11 @@ wss.on('connection', ws => {
         }
       }
 
-      if (serverContent?.turnComplete) aiSpeaking = false;
+      if (serverContent?.turnComplete) {
+        console.log(call.callId, 'Gemini turn complete', responseNumber, 'audio frames:', responseAudioFrames, 'voiced input frames:', voicedInputFrames);
+        responseAudioFrames = 0;
+        aiSpeaking = false;
+      }
 
       if (message.error) {
         console.error(call.callId, 'gemini live error', message.error);
@@ -209,12 +221,14 @@ wss.on('connection', ws => {
       const audio = Buffer.isBuffer(data) ? data : Buffer.from(data);
       if (audio.length < 2) return;
       inputFrames++;
+      const rms = pcmRms(audio);
+      if (rms >= BARGE_IN_RMS) voicedInputFrames++;
       if (inputFrames === 1 || inputFrames % 100 === 0) {
-        console.log(call.callId, 'caller audio frames received', inputFrames, 'latest frame', audio.length, 'bytes');
+        console.log(call.callId, 'caller audio frames received', inputFrames, 'latest frame', audio.length, 'bytes', 'RMS:', Math.round(rms), 'frames above speech threshold:', voicedInputFrames);
       }
 
       if (aiSpeaking) {
-        loudFrames = pcmRms(audio) >= BARGE_IN_RMS ? loudFrames + 1 : 0;
+        loudFrames = rms >= BARGE_IN_RMS ? loudFrames + 1 : 0;
         if (loudFrames >= BARGE_IN_FRAMES) {
           sendClear('caller speech detected');
           loudFrames = 0;
