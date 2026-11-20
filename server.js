@@ -11,7 +11,6 @@ const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Kore').trim();
 const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ומכבד.').trim();
 const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
 const BARGE_IN_FRAMES = Math.max(1, Number(process.env.BARGE_IN_FRAMES) || 3);
-const MAX_PENDING_AUDIO_BYTES = 5 * 8000 * 2;
 const PBX_AUDIO_FRAME_BYTES = 320;
 const PBX_AUDIO_FRAME_MS = 20;
 const MAX_PBX_AUDIO_QUEUE_BYTES = 10 * 8000 * 2;
@@ -79,16 +78,8 @@ wss.on('connection', ws => {
   const call = { callId: '', caller: '', system: '', token: '', closing: false };
   let gemini = null;
   let geminiReady = false;
-  let started = false;
   let aiSpeaking = false;
   let loudFrames = 0;
-  let pendingAudio = [];
-  let pendingAudioBytes = 0;
-  let inputFrames = 0;
-  let outputFrames = 0;
-  let responseNumber = 0;
-  let responseAudioFrames = 0;
-  let voicedInputFrames = 0;
   const pbxAudioQueue = [];
   let pbxAudioQueueOffset = 0;
   let pbxAudioQueueBytes = 0;
@@ -151,8 +142,6 @@ wss.on('connection', ws => {
       }
     }
     ws.send(frame, { binary: true });
-    outputFrames++;
-    if (outputFrames === 1) console.log(call.callId, 'first paced Gemini audio frame sent to PBX', frame.length, 'bytes');
   };
 
   let pbxAudioFlushPending = false;
@@ -204,8 +193,7 @@ wss.on('connection', ws => {
               }
             }
           },
-          systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-          inputAudioTranscription: {}
+          systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] }
         }
       }));
     });
@@ -216,25 +204,16 @@ wss.on('connection', ws => {
 
       if (message.setupComplete) {
         geminiReady = true;
-        console.log(call.callId, 'gemini live ready');
         gemini.send(JSON.stringify({
           clientContent: {
             turns: [{ role: 'user', parts: [{ text: `פתח את השיחה ואמור בדיוק: "${OPENING_GREETING}"` }] }],
             turnComplete: true
           }
         }));
-        console.log(call.callId, 'opening greeting requested');
-        const discarded = pendingAudio.length;
-        pendingAudio = [];
-        pendingAudioBytes = 0;
-        if (discarded) console.log(call.callId, 'discarded audio received before Gemini was ready', discarded, 'frames');
         return;
       }
 
       const serverContent = message.serverContent;
-      if (serverContent?.inputTranscription?.text) {
-        console.log(call.callId, 'Gemini caller transcription event', serverContent.inputTranscription.text.length, 'characters', serverContent.inputTranscription.finished ? 'final' : 'partial');
-      }
       if (serverContent?.interrupted) {
         console.log(call.callId, 'Gemini reported interrupted response');
         sendClear('Gemini detected caller interruption');
@@ -250,19 +229,12 @@ wss.on('connection', ws => {
         const outputRate = Number(/rate=(\d+)/i.exec(pcmMime)?.[1]) || 24000;
         const pcm8k = outputRate === 8000 ? pcm : pcm24kTo8k(pcm);
         if (ws.readyState === WebSocket.OPEN && pcm8k.length) {
-          if (responseAudioFrames === 0) {
-            responseNumber++;
-            console.log(call.callId, 'Gemini response audio started', responseNumber, pcmMime || 'rate=24000 assumed');
-          }
-          responseAudioFrames++;
           enqueuePbxAudio(pcm8k);
         }
       }
 
       if (serverContent?.turnComplete) {
         pbxAudioFlushPending = true;
-        console.log(call.callId, 'Gemini turn complete', responseNumber, 'audio frames:', responseAudioFrames, 'voiced input frames:', voicedInputFrames);
-        responseAudioFrames = 0;
         if (!pbxPlaybackTimer && pbxAudioQueueBytes > 0) {
           pbxPlaybackTimer = setInterval(pumpPbxAudio, PBX_AUDIO_FRAME_MS);
         }
@@ -275,7 +247,7 @@ wss.on('connection', ws => {
 
     gemini.on('close', (code, reason) => {
       geminiReady = false;
-      console.log(call.callId, 'gemini live closed', code, reason.toString(), 'caller frames:', inputFrames, 'audio frames sent:', outputFrames);
+      console.log(call.callId, 'gemini live closed', code, reason.toString());
       if (ws.readyState === WebSocket.OPEN && !call.closing) ws.close(1011, 'AI session closed');
     });
 
@@ -288,12 +260,7 @@ wss.on('connection', ws => {
     if (isBinary) {
       const audio = Buffer.isBuffer(data) ? data : Buffer.from(data);
       if (audio.length < 2) return;
-      inputFrames++;
       const rms = pcmRms(audio);
-      if (rms >= BARGE_IN_RMS) voicedInputFrames++;
-      if (inputFrames === 1 || inputFrames % 100 === 0) {
-        console.log(call.callId, 'caller audio frames received', inputFrames, 'latest frame', audio.length, 'bytes', 'RMS:', Math.round(rms), 'frames above speech threshold:', voicedInputFrames);
-      }
 
       if (aiSpeaking) {
         loudFrames = rms >= BARGE_IN_RMS ? loudFrames + 1 : 0;
@@ -307,13 +274,6 @@ wss.on('connection', ws => {
 
       if (geminiReady) {
         sendAudioToGemini(audio);
-      } else if (started && pendingAudioBytes < MAX_PENDING_AUDIO_BYTES) {
-        const copy = Buffer.from(audio);
-        pendingAudio.push(copy);
-        pendingAudioBytes += copy.length;
-        while (pendingAudioBytes > MAX_PENDING_AUDIO_BYTES && pendingAudio.length) {
-          pendingAudioBytes -= pendingAudio.shift().length;
-        }
       }
       return;
     }
@@ -326,7 +286,6 @@ wss.on('connection', ws => {
 
     switch (message.type) {
       case 'start':
-        started = true;
         Object.assign(call, {
           callId: String(message.callId || ''),
           caller: String(message.caller || ''),
