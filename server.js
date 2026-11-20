@@ -7,7 +7,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const STREAM_SECRET = String(process.env.STREAM_SECRET || '').trim();
 const GEMINI_LIVE_MODEL = String(process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-preview-12-2025').trim();
-const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Achird').trim();
+const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Kore').trim();
 const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ובצורה מכובדת.').trim();
 const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
 const BARGE_IN_FRAMES = Math.max(1, Number(process.env.BARGE_IN_FRAMES) || 3);
@@ -75,7 +75,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', ws => {
-  const call = { callId: '', caller: '', system: '', token: '', closing: false };
+  const call = { callId: '', caller: '', system: '', token: '', closing: false, startedAt: 0 };
   let gemini = null;
   let geminiReady = false;
   let aiSpeaking = false;
@@ -182,6 +182,7 @@ wss.on('connection', ws => {
     gemini = new WebSocket(endpoint);
 
     gemini.on('open', () => {
+      console.log(call.callId, 'Gemini WebSocket opened; sending setup for', GEMINI_LIVE_MODEL);
       gemini.send(JSON.stringify({
         setup: {
           model: `models/${GEMINI_LIVE_MODEL}`,
@@ -204,6 +205,7 @@ wss.on('connection', ws => {
 
       if (message.setupComplete) {
         geminiReady = true;
+        console.log(call.callId, 'Gemini setup complete');
         gemini.send(JSON.stringify({
           clientContent: {
             turns: [{ role: 'user', parts: [{ text: `פתח את השיחה ואמור בדיוק: "${OPENING_GREETING}"` }] }],
@@ -247,7 +249,8 @@ wss.on('connection', ws => {
 
     gemini.on('close', (code, reason) => {
       geminiReady = false;
-      console.log(call.callId, 'gemini live closed', code, reason.toString());
+      const durationMs = call.startedAt ? Date.now() - call.startedAt : 0;
+      console.log(call.callId, 'gemini live closed', code, reason.toString(), 'PBX state:', ws.readyState, 'call closing:', call.closing, 'duration ms:', durationMs);
       if (ws.readyState === WebSocket.OPEN && !call.closing) ws.close(1011, 'AI session closed');
     });
 
@@ -290,7 +293,8 @@ wss.on('connection', ws => {
           callId: String(message.callId || ''),
           caller: String(message.caller || ''),
           system: String(message.system || ''),
-          token: String(message.token || '')
+          token: String(message.token || ''),
+          startedAt: Date.now()
         });
         console.log(call.callId, 'PBX streaming call started', call.caller, call.system);
         openGemini();
@@ -302,6 +306,7 @@ wss.on('connection', ws => {
         break;
 
       case 'hangup':
+        console.log(call.callId, 'PBX hangup received');
         call.closing = true;
         closeGemini();
         if (ws.readyState === WebSocket.OPEN) ws.close();
@@ -312,8 +317,10 @@ wss.on('connection', ws => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
     call.closing = true;
+    const durationMs = call.startedAt ? Date.now() - call.startedAt : 0;
+    console.log(call.callId, 'PBX websocket closed', code, reason.toString(), 'duration ms:', durationMs);
     closeGemini();
   });
 
