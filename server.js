@@ -8,12 +8,14 @@ const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const STREAM_SECRET = String(process.env.STREAM_SECRET || '').trim();
 const GEMINI_LIVE_MODEL = String(process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-preview-12-2025').trim();
 const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Schedar').trim();
-const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ובצורה מכובדת.').trim();
+const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ומכבד.').trim();
 const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
 const BARGE_IN_FRAMES = Math.max(1, Number(process.env.BARGE_IN_FRAMES) || 3);
 const PBX_AUDIO_FRAME_BYTES = 320;
 const PBX_AUDIO_FRAME_MS = 20;
-const MAX_PBX_AUDIO_QUEUE_BYTES = 10 * 8000 * 2;
+const PBX_AUDIO_BYTES_PER_SECOND = 8000 * 2;
+const MAX_PBX_AUDIO_QUEUE_SECONDS = 30;
+const MAX_PBX_AUDIO_QUEUE_BYTES = MAX_PBX_AUDIO_QUEUE_SECONDS * PBX_AUDIO_BYTES_PER_SECOND;
 const OPENING_GREETING = 'שלום, איך אוכל לעזור לך היום?';
 
 function pcm8kTo16k(buffer) {
@@ -83,6 +85,7 @@ wss.on('connection', ws => {
   const pbxAudioQueue = [];
   let pbxAudioQueueOffset = 0;
   let pbxAudioQueueBytes = 0;
+  let pbxAudioQueuePeakBytes = 0;
   let pbxPlaybackTimer = null;
 
   const closeGemini = () => {
@@ -96,11 +99,14 @@ wss.on('connection', ws => {
   };
 
   const sendClear = reason => {
-    if (!aiSpeaking) return;
+    const hadPlayback = aiSpeaking || pbxAudioQueueBytes > 0;
+    if (!hadPlayback) return;
     aiSpeaking = false;
     pbxAudioQueue.length = 0;
     pbxAudioQueueOffset = 0;
     pbxAudioQueueBytes = 0;
+    pbxAudioQueuePeakBytes = 0;
+    pbxWsBufferedPeakBytes = 0;
     if (pbxPlaybackTimer) {
       clearInterval(pbxPlaybackTimer);
       pbxPlaybackTimer = null;
@@ -120,7 +126,15 @@ wss.on('connection', ws => {
       pbxPlaybackTimer = null;
       aiSpeaking = false;
       pbxAudioFlushPending = false;
-      console.log(call.callId, 'PBX audio playback queue drained');
+      console.log(
+        call.callId,
+        'PBX audio playback queue drained; peak queued seconds:',
+        (pbxAudioQueuePeakBytes / PBX_AUDIO_BYTES_PER_SECOND).toFixed(2),
+        'PBX WebSocket buffered bytes:',
+        ws.bufferedAmount
+      );
+      pbxAudioQueuePeakBytes = 0;
+      pbxWsBufferedPeakBytes = 0;
       return;
     }
 
@@ -142,13 +156,27 @@ wss.on('connection', ws => {
       }
     }
     ws.send(frame, { binary: true });
+    pbxWsBufferedPeakBytes = Math.max(pbxWsBufferedPeakBytes, ws.bufferedAmount);
   };
 
   let pbxAudioFlushPending = false;
+  let pbxWsBufferedPeakBytes = 0;
   const enqueuePbxAudio = audio => {
     if (!audio.length) return;
     if (pbxAudioQueueBytes + audio.length > MAX_PBX_AUDIO_QUEUE_BYTES) {
-      console.error(call.callId, 'PBX audio queue exceeded 10 seconds; closing call to avoid runaway buffering');
+      console.error(
+        call.callId,
+        'PBX audio queue limit exceeded; queued seconds:',
+        (pbxAudioQueueBytes / PBX_AUDIO_BYTES_PER_SECOND).toFixed(2),
+        'incoming seconds:',
+        (audio.length / PBX_AUDIO_BYTES_PER_SECOND).toFixed(2),
+        'limit seconds:',
+        MAX_PBX_AUDIO_QUEUE_SECONDS,
+        'PBX WebSocket buffered bytes:',
+        ws.bufferedAmount,
+        'peak PBX WebSocket buffered bytes:',
+        pbxWsBufferedPeakBytes
+      );
       call.closing = true;
       closeGemini();
       if (ws.readyState === WebSocket.OPEN) ws.close(1011, 'audio playback backlog');
@@ -156,6 +184,7 @@ wss.on('connection', ws => {
     }
     pbxAudioQueue.push(audio);
     pbxAudioQueueBytes += audio.length;
+    pbxAudioQueuePeakBytes = Math.max(pbxAudioQueuePeakBytes, pbxAudioQueueBytes);
     pbxAudioFlushPending = false;
     aiSpeaking = true;
     if (!pbxPlaybackTimer) pbxPlaybackTimer = setInterval(pumpPbxAudio, PBX_AUDIO_FRAME_MS);
