@@ -7,7 +7,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const STREAM_SECRET = String(process.env.STREAM_SECRET || '').trim();
 const GEMINI_LIVE_MODEL = String(process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-preview-12-2025').trim();
-const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Sadaltager').trim();
+const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Sadachbia').trim();
 const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ומכבד.').trim();
 const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
 const BARGE_IN_FRAMES = Math.max(1, Number(process.env.BARGE_IN_FRAMES) || 3);
@@ -84,6 +84,7 @@ wss.on('connection', ws => {
   let geminiResponseAudioChunks = 0;
   let geminiResponseAudioBytes = 0;
   let geminiResponseAudioRate = 24000;
+  let droppingAssistantAudio = false;
   let aiSpeaking = false;
   let loudFrames = 0;
   const pbxAudioQueue = [];
@@ -170,7 +171,7 @@ wss.on('connection', ws => {
     if (pbxAudioQueueBytes + audio.length > MAX_PBX_AUDIO_QUEUE_BYTES) {
       console.error(
         call.callId,
-        'PBX audio queue limit exceeded; queued seconds:',
+        'PBX audio queue limit exceeded; stopping current response audio and keeping call open; queued seconds:',
         (pbxAudioQueueBytes / PBX_AUDIO_BYTES_PER_SECOND).toFixed(2),
         'incoming seconds:',
         (audio.length / PBX_AUDIO_BYTES_PER_SECOND).toFixed(2),
@@ -181,9 +182,8 @@ wss.on('connection', ws => {
         'peak PBX WebSocket buffered bytes:',
         pbxWsBufferedPeakBytes
       );
-      call.closing = true;
-      closeGemini();
-      if (ws.readyState === WebSocket.OPEN) ws.close(1011, 'audio playback backlog');
+      droppingAssistantAudio = true;
+      sendClear('audio queue limit exceeded; current response will be partial');
       return;
     }
     pbxAudioQueue.push(audio);
@@ -260,11 +260,13 @@ wss.on('connection', ws => {
         geminiResponseAudioChunks = 0;
         geminiResponseAudioBytes = 0;
         geminiResponseAudioRate = 24000;
+        droppingAssistantAudio = false;
         sendClear('Gemini detected caller interruption');
       }
 
       const parts = serverContent?.modelTurn?.parts || [];
       for (const part of parts) {
+        if (droppingAssistantAudio) continue;
         const inline = part.inlineData || part.inline_data;
         const base64 = inline?.data;
         if (!base64) continue;
@@ -284,6 +286,10 @@ wss.on('connection', ws => {
       }
 
       if (serverContent?.turnComplete) {
+        if (droppingAssistantAudio) {
+          console.warn(call.callId, 'Gemini response audio was stopped after queue limit; call remains open');
+          droppingAssistantAudio = false;
+        }
         console.log(
           call.callId,
           'Gemini turn complete; audio chunks:',
