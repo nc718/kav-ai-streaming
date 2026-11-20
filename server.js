@@ -12,6 +12,9 @@ const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עו
 const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
 const BARGE_IN_FRAMES = Math.max(1, Number(process.env.BARGE_IN_FRAMES) || 3);
 const MAX_PENDING_AUDIO_BYTES = 5 * 8000 * 2;
+const PBX_AUDIO_FRAME_BYTES = 320;
+const PBX_AUDIO_FRAME_MS = 20;
+const MAX_PBX_AUDIO_QUEUE_BYTES = 10 * 8000 * 2;
 const OPENING_GREETING = 'שלום, איך אוכל לעזור לך היום?';
 
 function pcm8kTo16k(buffer) {
@@ -86,6 +89,10 @@ wss.on('connection', ws => {
   let responseNumber = 0;
   let responseAudioFrames = 0;
   let voicedInputFrames = 0;
+  const pbxAudioQueue = [];
+  let pbxAudioQueueOffset = 0;
+  let pbxAudioQueueBytes = 0;
+  let pbxPlaybackTimer = null;
 
   const closeGemini = () => {
     if (gemini && gemini.readyState === WebSocket.OPEN) gemini.close();
@@ -100,8 +107,69 @@ wss.on('connection', ws => {
   const sendClear = reason => {
     if (!aiSpeaking) return;
     aiSpeaking = false;
+    pbxAudioQueue.length = 0;
+    pbxAudioQueueOffset = 0;
+    pbxAudioQueueBytes = 0;
+    if (pbxPlaybackTimer) {
+      clearInterval(pbxPlaybackTimer);
+      pbxPlaybackTimer = null;
+    }
     console.log(call.callId, 'clearing playback:', reason);
     sendPBX({ type: 'clear' });
+  };
+
+  const pumpPbxAudio = () => {
+    if (ws.readyState !== WebSocket.OPEN) {
+      if (pbxPlaybackTimer) clearInterval(pbxPlaybackTimer);
+      pbxPlaybackTimer = null;
+      return;
+    }
+    if (pbxAudioQueueBytes === 0) {
+      if (pbxPlaybackTimer) clearInterval(pbxPlaybackTimer);
+      pbxPlaybackTimer = null;
+      aiSpeaking = false;
+      pbxAudioFlushPending = false;
+      console.log(call.callId, 'PBX audio playback queue drained');
+      return;
+    }
+
+    const frameLength = Math.min(PBX_AUDIO_FRAME_BYTES, pbxAudioQueueBytes);
+    if (frameLength < PBX_AUDIO_FRAME_BYTES && !pbxAudioFlushPending) return;
+    const frame = Buffer.alloc(frameLength);
+    let written = 0;
+    while (written < frameLength) {
+      const current = pbxAudioQueue[0];
+      const available = current.length - pbxAudioQueueOffset;
+      const take = Math.min(available, frameLength - written);
+      current.copy(frame, written, pbxAudioQueueOffset, pbxAudioQueueOffset + take);
+      written += take;
+      pbxAudioQueueOffset += take;
+      pbxAudioQueueBytes -= take;
+      if (pbxAudioQueueOffset === current.length) {
+        pbxAudioQueue.shift();
+        pbxAudioQueueOffset = 0;
+      }
+    }
+    ws.send(frame, { binary: true });
+    outputFrames++;
+    if (outputFrames === 1) console.log(call.callId, 'first paced Gemini audio frame sent to PBX', frame.length, 'bytes');
+  };
+
+  let pbxAudioFlushPending = false;
+  const enqueuePbxAudio = audio => {
+    if (!audio.length) return;
+    if (pbxAudioQueueBytes + audio.length > MAX_PBX_AUDIO_QUEUE_BYTES) {
+      console.error(call.callId, 'PBX audio queue exceeded 10 seconds; closing call to avoid runaway buffering');
+      call.closing = true;
+      closeGemini();
+      if (ws.readyState === WebSocket.OPEN) ws.close(1011, 'audio playback backlog');
+      return;
+    }
+    pbxAudioQueue.push(audio);
+    pbxAudioQueueBytes += audio.length;
+    pbxAudioFlushPending = false;
+    aiSpeaking = true;
+    if (!pbxPlaybackTimer) pbxPlaybackTimer = setInterval(pumpPbxAudio, PBX_AUDIO_FRAME_MS);
   };
 
   const sendAudioToGemini = audio => {
@@ -187,17 +255,17 @@ wss.on('connection', ws => {
             console.log(call.callId, 'Gemini response audio started', responseNumber, pcmMime || 'rate=24000 assumed');
           }
           responseAudioFrames++;
-          aiSpeaking = true;
-          ws.send(pcm8k, { binary: true });
-          outputFrames++;
-          if (outputFrames === 1) console.log(call.callId, 'first Gemini audio frame sent to PBX', pcmMime || 'rate=24000 assumed');
+          enqueuePbxAudio(pcm8k);
         }
       }
 
       if (serverContent?.turnComplete) {
+        pbxAudioFlushPending = true;
         console.log(call.callId, 'Gemini turn complete', responseNumber, 'audio frames:', responseAudioFrames, 'voiced input frames:', voicedInputFrames);
         responseAudioFrames = 0;
-        aiSpeaking = false;
+        if (!pbxPlaybackTimer && pbxAudioQueueBytes > 0) {
+          pbxPlaybackTimer = setInterval(pumpPbxAudio, PBX_AUDIO_FRAME_MS);
+        }
       }
 
       if (message.error) {
