@@ -61,7 +61,6 @@ wss.on('connection', ws => {
   const call = { callId: '', caller: '', system: '', token: '', closing: false };
   let gemini = null;
   let geminiReady = false;
-  let aiSpeaking = false;
 
   const closeGemini = () => {
     if (gemini && gemini.readyState === WebSocket.OPEN) gemini.close();
@@ -112,7 +111,6 @@ wss.on('connection', ws => {
 
       const serverContent = message.serverContent;
       if (serverContent?.interrupted) {
-        aiSpeaking = false;
         sendPBX({ type: 'clear' });
       }
 
@@ -125,12 +123,9 @@ wss.on('connection', ws => {
         const pcmMime = inline.mimeType || inline.mime_type || '';
         const pcm8k = /rate=24000|24000/.test(pcmMime) ? pcm24kTo8k(pcm24k) : pcm24k;
         if (ws.readyState === WebSocket.OPEN && pcm8k.length) {
-          aiSpeaking = true;
           ws.send(pcm8k, { binary: true });
         }
       }
-
-      if (serverContent?.turnComplete) aiSpeaking = false;
 
       if (message.error) {
         console.error(call.callId, 'gemini live error', message.error);
@@ -151,10 +146,6 @@ wss.on('connection', ws => {
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
       if (!geminiReady || !gemini || gemini.readyState !== WebSocket.OPEN) return;
-      if (aiSpeaking) {
-        aiSpeaking = false;
-        sendPBX({ type: 'clear' });
-      }
       const pcm16k = pcm8kTo16k(Buffer.isBuffer(data) ? data : Buffer.from(data));
       gemini.send(JSON.stringify({
         realtimeInput: {
