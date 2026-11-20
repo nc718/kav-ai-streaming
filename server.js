@@ -133,7 +133,8 @@ wss.on('connection', ws => {
               }
             }
           },
-          systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] }
+          systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+          inputAudioTranscription: {}
         }
       }));
     });
@@ -161,6 +162,9 @@ wss.on('connection', ws => {
       }
 
       const serverContent = message.serverContent;
+      if (serverContent?.inputTranscription?.finished && serverContent.inputTranscription.text) {
+        console.log(call.callId, 'Gemini received caller speech transcript', serverContent.inputTranscription.text.length, 'characters');
+      }
       if (serverContent?.interrupted) {
         sendClear('Gemini detected caller interruption');
       }
@@ -205,7 +209,9 @@ wss.on('connection', ws => {
       const audio = Buffer.isBuffer(data) ? data : Buffer.from(data);
       if (audio.length < 2) return;
       inputFrames++;
-      if (inputFrames === 1) console.log(call.callId, 'first caller audio frame received', audio.length, 'bytes');
+      if (inputFrames === 1 || inputFrames % 100 === 0) {
+        console.log(call.callId, 'caller audio frames received', inputFrames, 'latest frame', audio.length, 'bytes');
+      }
 
       if (aiSpeaking) {
         loudFrames = pcmRms(audio) >= BARGE_IN_RMS ? loudFrames + 1 : 0;
