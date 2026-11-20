@@ -6,7 +6,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 const PORT = Number(process.env.PORT) || 3000;
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const STREAM_SECRET = String(process.env.STREAM_SECRET || '').trim();
-const GEMINI_LIVE_MODEL = String(process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio').trim();
+const GEMINI_LIVE_MODEL = String(process.env.GEMINI_LIVE_MODEL || 'gemini-live-2.5-flash-native-audio').trim();
 const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Kore').trim();
 const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ובצורה מכובדת.').trim();
 const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
