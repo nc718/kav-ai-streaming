@@ -9,6 +9,10 @@ const STREAM_SECRET = String(process.env.STREAM_SECRET || '').trim();
 const GEMINI_LIVE_MODEL = String(process.env.GEMINI_LIVE_MODEL || 'gemini-2.5-flash-native-audio-preview-12-2025').trim();
 const GEMINI_VOICE = String(process.env.GEMINI_VOICE || 'Kore').trim();
 const SYSTEM_INSTRUCTION = String(process.env.SYSTEM_INSTRUCTION || 'אתה עוזר קולי בעברית לשיחות טלפון. דבר בעברית טבעית, בקיצור ומכבד.').trim();
+const BARGE_IN_RMS = Number(process.env.BARGE_IN_RMS) || 800;
+const BARGE_IN_FRAMES = Math.max(1, Number(process.env.BARGE_IN_FRAMES) || 3);
+const MAX_PENDING_AUDIO_BYTES = 5 * 8000 * 2;
+const OPENING_GREETING = 'שלום, איך אוכל לעזור לך היום?';
 
 function pcm8kTo16k(buffer) {
   if (!buffer.length) return Buffer.alloc(0);
@@ -32,6 +36,17 @@ function pcm24kTo8k(buffer) {
     out.writeInt16LE(Math.round(sum / 3), i * 2);
   }
   return out;
+}
+
+function pcmRms(buffer) {
+  const samples = Math.floor(buffer.length / 2);
+  if (!samples) return 0;
+  let sum = 0;
+  for (let i = 0; i < samples; i++) {
+    const sample = buffer.readInt16LE(i * 2);
+    sum += sample * sample;
+  }
+  return Math.sqrt(sum / samples);
 }
 
 const app = express();
@@ -61,6 +76,13 @@ wss.on('connection', ws => {
   const call = { callId: '', caller: '', system: '', token: '', closing: false };
   let gemini = null;
   let geminiReady = false;
+  let started = false;
+  let aiSpeaking = false;
+  let loudFrames = 0;
+  let pendingAudio = [];
+  let pendingAudioBytes = 0;
+  let inputFrames = 0;
+  let outputFrames = 0;
 
   const closeGemini = () => {
     if (gemini && gemini.readyState === WebSocket.OPEN) gemini.close();
@@ -70,6 +92,23 @@ wss.on('connection', ws => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(payload));
     }
+  };
+
+  const sendClear = reason => {
+    if (!aiSpeaking) return;
+    aiSpeaking = false;
+    console.log(call.callId, 'clearing playback:', reason);
+    sendPBX({ type: 'clear' });
+  };
+
+  const sendAudioToGemini = audio => {
+    if (!geminiReady || !gemini || gemini.readyState !== WebSocket.OPEN) return;
+    const pcm16k = pcm8kTo16k(audio);
+    gemini.send(JSON.stringify({
+      realtimeInput: {
+        mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: pcm16k.toString('base64') }]
+      }
+    }));
   };
 
   const openGemini = () => {
@@ -106,12 +145,24 @@ wss.on('connection', ws => {
       if (message.setupComplete) {
         geminiReady = true;
         console.log(call.callId, 'gemini live ready');
+        gemini.send(JSON.stringify({
+          clientContent: {
+            turns: [{ role: 'user', parts: [{ text: `פתח את השיחה ואמור בדיוק: "${OPENING_GREETING}"` }] }],
+            turnComplete: true
+          }
+        }));
+        console.log(call.callId, 'opening greeting requested');
+        const queued = pendingAudio;
+        pendingAudio = [];
+        pendingAudioBytes = 0;
+        for (const audio of queued) sendAudioToGemini(audio);
+        if (queued.length) console.log(call.callId, 'flushed buffered caller audio frames', queued.length);
         return;
       }
 
       const serverContent = message.serverContent;
       if (serverContent?.interrupted) {
-        sendPBX({ type: 'clear' });
+        sendClear('Gemini detected caller interruption');
       }
 
       const parts = serverContent?.modelTurn?.parts || [];
@@ -119,13 +170,19 @@ wss.on('connection', ws => {
         const inline = part.inlineData || part.inline_data;
         const base64 = inline?.data;
         if (!base64) continue;
-        const pcm24k = Buffer.from(base64, 'base64');
+        const pcm = Buffer.from(base64, 'base64');
         const pcmMime = inline.mimeType || inline.mime_type || '';
-        const pcm8k = /rate=24000|24000/.test(pcmMime) ? pcm24kTo8k(pcm24k) : pcm24k;
+        const outputRate = Number(/rate=(\d+)/i.exec(pcmMime)?.[1]) || 24000;
+        const pcm8k = outputRate === 8000 ? pcm : pcm24kTo8k(pcm);
         if (ws.readyState === WebSocket.OPEN && pcm8k.length) {
+          aiSpeaking = true;
           ws.send(pcm8k, { binary: true });
+          outputFrames++;
+          if (outputFrames === 1) console.log(call.callId, 'first Gemini audio frame sent to PBX', pcmMime || 'rate=24000 assumed');
         }
       }
+
+      if (serverContent?.turnComplete) aiSpeaking = false;
 
       if (message.error) {
         console.error(call.callId, 'gemini live error', message.error);
@@ -134,7 +191,7 @@ wss.on('connection', ws => {
 
     gemini.on('close', (code, reason) => {
       geminiReady = false;
-      console.log(call.callId, 'gemini live closed', code, reason.toString());
+      console.log(call.callId, 'gemini live closed', code, reason.toString(), 'caller frames:', inputFrames, 'audio frames sent:', outputFrames);
       if (ws.readyState === WebSocket.OPEN && !call.closing) ws.close(1011, 'AI session closed');
     });
 
@@ -145,13 +202,31 @@ wss.on('connection', ws => {
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
-      if (!geminiReady || !gemini || gemini.readyState !== WebSocket.OPEN) return;
-      const pcm16k = pcm8kTo16k(Buffer.isBuffer(data) ? data : Buffer.from(data));
-      gemini.send(JSON.stringify({
-        realtimeInput: {
-          mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: pcm16k.toString('base64') }]
+      const audio = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (audio.length < 2) return;
+      inputFrames++;
+      if (inputFrames === 1) console.log(call.callId, 'first caller audio frame received', audio.length, 'bytes');
+
+      if (aiSpeaking) {
+        loudFrames = pcmRms(audio) >= BARGE_IN_RMS ? loudFrames + 1 : 0;
+        if (loudFrames >= BARGE_IN_FRAMES) {
+          sendClear('caller speech detected');
+          loudFrames = 0;
         }
-      }));
+      } else {
+        loudFrames = 0;
+      }
+
+      if (geminiReady) {
+        sendAudioToGemini(audio);
+      } else if (started && pendingAudioBytes < MAX_PENDING_AUDIO_BYTES) {
+        const copy = Buffer.from(audio);
+        pendingAudio.push(copy);
+        pendingAudioBytes += copy.length;
+        while (pendingAudioBytes > MAX_PENDING_AUDIO_BYTES && pendingAudio.length) {
+          pendingAudioBytes -= pendingAudio.shift().length;
+        }
+      }
       return;
     }
 
@@ -163,6 +238,7 @@ wss.on('connection', ws => {
 
     switch (message.type) {
       case 'start':
+        started = true;
         Object.assign(call, {
           callId: String(message.callId || ''),
           caller: String(message.caller || ''),
